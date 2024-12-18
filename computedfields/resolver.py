@@ -993,6 +993,7 @@ class Resolver:
                 "payment_id",
                 "tax_line_id",
                 "account_root",
+                "display_type",
                 "price_subtotal",
                 "price_total",
                 "amount_residual",
