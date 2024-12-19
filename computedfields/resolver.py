@@ -984,7 +984,7 @@ class Resolver:
                 "date",
                 "invoice_date",
                 "ref",
-                "contact",
+                "contact_id",
                 "currency_rate",
                 "balance",
                 "debit",
