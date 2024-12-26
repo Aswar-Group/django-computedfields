@@ -994,6 +994,7 @@ class Resolver:
                 "tax_line_id",
                 "account_root",
                 "display_type",
+                "product_uom_id",
                 "price_subtotal",
                 "price_total",
                 "amount_residual",
