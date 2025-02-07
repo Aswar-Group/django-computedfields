@@ -972,8 +972,25 @@ class Resolver:
         if not self.has_computedfields(model):
             return update_fields
         cf_mro = self.get_local_mro(model, update_fields)
-        from accounting.models import AccountMoveLine, RegisterPayment, AccountPartialReconcile
-        if isinstance(instance, AccountMoveLine):
+        from accounting.models import AccountMove, AccountMoveLine, RegisterPayment, AccountPartialReconcile
+        if isinstance(instance, AccountMove):
+            cf_mro = [
+                "journal_id",
+                "company_id",
+                "company_currency_id",
+                "currency_id",
+                "amount_untaxed",
+                "amount_tax",
+                "amount_total",
+                "amount_residual",
+                "amount_untaxed_signed",
+                "amount_tax_signed",
+                "amount_total_signed",
+                "amount_total_in_currency_signed",
+                "amount_residual_signed",
+                "payment_state",
+            ]
+        elif isinstance(instance, AccountMoveLine):
             cf_mro = [
                 "journal_id",
                 "company_id",
