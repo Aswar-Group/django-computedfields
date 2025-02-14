@@ -1010,6 +1010,7 @@ class Resolver:
                 "payment_id",
                 "tax_line_id",
                 "account_root",
+                "sequence",
                 "display_type",
                 "product_uom_id",
                 "price_subtotal",
