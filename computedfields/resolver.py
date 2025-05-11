@@ -972,7 +972,7 @@ class Resolver:
         if not self.has_computedfields(model):
             return update_fields
         cf_mro = self.get_local_mro(model, update_fields)
-        from accounting.models import AccountMove, AccountMoveLine, RegisterPayment, AccountPartialReconcile
+        from accounting.models import AccountMove, AccountMoveLine, RegisterPayment, AccountPartialReconcile, ReconcileWizard
         if isinstance(instance, AccountMove):
             cf_mro = [
                 "journal_id",
@@ -989,6 +989,7 @@ class Resolver:
                 "amount_total_in_currency_signed",
                 "amount_residual_signed",
                 "payment_state",
+                "depreciation_value",
             ]
         elif isinstance(instance, AccountMoveLine):
             cf_mro = [
@@ -1045,6 +1046,8 @@ class Resolver:
                 "credit_move_line_currency_id",
                 "max_date",
             ]
+        elif isinstance(instance, ReconcileWizard) and update_fields:
+            cf_mro = [x for x in cf_mro if x not in update_fields]
         if update_fields:
             update_fields = set(update_fields)
             update_fields.update(set(cf_mro))
