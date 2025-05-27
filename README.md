@@ -104,6 +104,12 @@ The documentation can be found [here](https://django-computedfields.readthedocs.
 
 #### Changelog
 
+- 0.2.9
+    - fix related_query_name issue
+- 0.2.8
+    - Django 5.2 support
+- 0.2.7
+    - setuptools issue fixed
 - 0.2.6
     - Django 5.1 support
 - 0.2.5
