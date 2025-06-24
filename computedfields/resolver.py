@@ -25,6 +25,46 @@ from typing_extensions import TypedDict
 from django.db.models import Field, Model
 from .graph import IComputedField, IDepends, IFkMap, ILocalMroMap, ILookupMap, _ST, _GT, F
 
+from django.db.models.sql.where import WhereNode
+
+def has_backward_filter(qs):
+    """
+    Returns True if the QuerySet `qs` has any filters over a 
+    one-to-many or many-to-many join (e.g. lines__isnull, lines__foo).
+    """
+    query = qs.query
+
+    def inspect(node):
+        for child in node.children:
+            # nested AND/OR
+            if isinstance(child, WhereNode):
+                if inspect(child):
+                    return True
+
+            # new‐style: a Lookup/WhereClause object with .lhs.alias
+            else:
+                lhs = getattr(child, "lhs", None)
+                if lhs is not None:
+                    alias = getattr(lhs, "alias", None)
+                    if alias:
+                        join = query.alias_map.get(alias)
+                        jf = getattr(join, "join_field", None)
+                        if jf and (jf.one_to_many or jf.many_to_many):
+                            return True
+
+                # fallback for older Django: a plain tuple (lhs, lookup, rhs)
+                if isinstance(child, (list, tuple)) and len(child) >= 1:
+                    old_lhs = child[0]
+                    alias = getattr(old_lhs, "alias", None)
+                    if alias:
+                        join = query.alias_map.get(alias)
+                        jf = getattr(join, "join_field", None)
+                        if jf and (jf.one_to_many or jf.many_to_many):
+                            return True
+
+        return False
+
+    return inspect(query.where)
 
 class IM2mData(TypedDict):
     left: str
@@ -531,7 +571,7 @@ class Resolver:
         querysize: Optional[int] = None
     ) -> Optional[Set[Any]]:
         """
-        Update local computed fields and descent in the dependency tree by calling
+        Update local computed fields and descend in the dependency tree by calling
         ``update_dependent`` for dependent models.
 
         This method does the local field updates on `queryset`:
@@ -558,7 +598,22 @@ class Resolver:
         #       also see #101
         if queryset.query.can_filter() and not queryset.query.distinct_fields:
             if queryset.query.combinator != "union":
-                queryset = queryset.distinct()
+                # we only need DISTINCT if one of our joins is a back-relation
+                has_back_ref = any(
+                    getattr(join.join_field, "one_to_many", False)
+                    or getattr(join.join_field, "many_to_many", False)
+                    for join in queryset.query.alias_map.values()
+                    if hasattr(join, "join_field")
+                )
+                # join_field_names = [
+                #     join.join_field.name
+                #     for join in q.alias_map.values()
+                #     if hasattr(join, "join_field")
+                #     and (join.join_field.one_to_many or join.join_field.many_to_many)
+                # ]
+                # if has_backward_filter(queryset):
+                if has_back_ref:
+                    queryset = queryset.distinct()
         else:
             queryset = model._base_manager.filter(pk__in=subquery_pk(queryset, queryset.db))
 
@@ -575,25 +630,86 @@ class Resolver:
         if prefetch:
             queryset = queryset.prefetch_related(*prefetch)
 
+        # ─── Gather “batch‐compute groups” from the model definition ───────────────
+        raw_groups: Dict[str, Tuple[Set[str], str]] = getattr(model, "BATCH_COMPUTE_GROUPS", {})
+
+        # Build a mapping: field_name → (group_name, group_fields, compute_fn)
+        field_to_group: Dict[str, Tuple[str, Set[str], Callable[[Model], Dict[str, Any]]]] = {}
+        for group_name, (group_fields, compute_method_name) in raw_groups.items():
+            # Only consider group if any of its fields appear in our MRO‐derived fields
+            intersecting = group_fields.intersection(fields)
+            if not intersecting:
+                continue
+
+            # Build a compute_fn that calls instance.compute_method_name()
+            def _make_compute_fn(method_name: str) -> Callable[[Model], Dict[str, Any]]:
+                def _runner(inst: Model) -> Dict[str, Any]:
+                    fn = getattr(inst, method_name)
+                    return fn()
+                return _runner
+
+            compute_fn = _make_compute_fn(compute_method_name)
+            for fld in intersecting:
+                field_to_group[fld] = (group_name, intersecting, compute_fn)
+
         pks = []
         if fields:
             q_size = self.get_querysize(model, fields, querysize)
             change: List[Model] = []
+
             for elem in slice_iterator(queryset, q_size):
                 # note on the loop: while it is technically not needed to batch things here,
                 # we still prebatch to not cause memory issues for very big querysets
                 has_changed = False
+                computed_groups: Set[str] = set()
+                group_results: Dict[str, Any] = {}
+
+                # Iterate through each computed‐field in MRO order
                 for comp_field in mro:
-                    new_value = self._compute(elem, model, comp_field)
-                    if new_value != getattr(elem, comp_field):
-                        has_changed = True
-                        setattr(elem, comp_field, new_value)
+                    # 1) If this field is part of a batch‐group
+                    if comp_field in field_to_group:
+                        group_name, group_fields, compute_fn = field_to_group[comp_field]
+
+                        # If this group hasn't been computed yet, do it now
+                        if group_name not in computed_groups:
+                            result_dict = compute_fn(elem)
+
+                            # Sanity check: ensure every field in group_fields is present
+                            missing = [f for f in group_fields if f not in result_dict]
+                            if missing:
+                                raise KeyError(
+                                    f"{compute_fn.__name__}() did not return these requested fields: {missing}"
+                                )
+
+                            # Store all returned values for this group
+                            for f in group_fields:
+                                group_results[f] = result_dict[f]
+
+                            computed_groups.add(group_name)
+
+                        # Now assign this field from the group_results
+                        new_value = group_results[comp_field]
+                        if new_value != getattr(elem, comp_field):
+                            setattr(elem, comp_field, new_value)
+                            has_changed = True
+
+                    else:
+                        # 2) Fallback: no batch‐group covers this field → compute individually
+                        new_value = self._compute(elem, model, comp_field)
+                        if new_value != getattr(elem, comp_field):
+                            setattr(elem, comp_field, new_value)
+                            has_changed = True
+
                 if has_changed:
                     change.append(elem)
                     pks.append(elem.pk)
+
+                # Flush a batch of changes when we hit the batchsize
                 if len(change) >= self._batchsize:
                     self._update(model._base_manager.all(), change, fields)
                     change = []
+
+            # After loop, flush any remaining changes
             if change:
                 self._update(model._base_manager.all(), change, fields)
 
@@ -603,7 +719,7 @@ class Resolver:
         if not local_only and pks:
             self.update_dependent(model._base_manager.filter(pk__in=pks), model, fields, update_local=False)
         return set(pks) if return_pks else None
-    
+
     def _update(self, queryset: QuerySet, change: Sequence[Any], fields: Sequence[str]) -> Union[int, None]:
         # we can skip batch_size here, as it already was batched in bulk_updater
         if self.use_fastupdate:
@@ -972,87 +1088,62 @@ class Resolver:
         if not self.has_computedfields(model):
             return update_fields
         cf_mro = self.get_local_mro(model, update_fields)
-        from accounting.models import AccountMove, AccountMoveLine, RegisterPayment, AccountPartialReconcile, ReconcileWizard
-        if isinstance(instance, AccountMove):
-            cf_mro = [
-                "journal_id",
-                "company_id",
-                "company_currency_id",
-                "currency_id",
-                "amount_untaxed",
-                "amount_tax",
-                "amount_total",
-                "amount_residual",
-                "amount_untaxed_signed",
-                "amount_tax_signed",
-                "amount_total_signed",
-                "amount_total_in_currency_signed",
-                "amount_residual_signed",
-                "payment_state",
-                "depreciation_value",
-            ]
-        elif isinstance(instance, AccountMoveLine):
-            cf_mro = [
-                "journal_id",
-                "company_id",
-                "company_currency_id",
-                "currency_id",
-                "move_name",
-                "parent_state",
-                "date",
-                "invoice_date",
-                "ref",
-                "contact_id",
-                "currency_rate",
-                "balance",
-                "debit",
-                "credit",
-                "amount_currency",
-                "payment_id",
-                "tax_line_id",
-                "account_root",
-                "sequence",
-                "display_type",
-                "product_uom_id",
-                "price_subtotal",
-                "price_total",
-                "amount_residual",
-                "amount_residual_currency",
-                "reconciled",
-            ]
-        elif isinstance(instance, RegisterPayment) and update_fields:
+
+        from accounting.models import RegisterPayment, ReconcileWizard
+        if isinstance(instance, RegisterPayment) and update_fields:
             cf_mro = [x for x in cf_mro if x not in update_fields]
-        elif isinstance(instance, RegisterPayment):
-            cf_mro = [
-                "journal_id",
-                "currency_id",
-                "amount",
-                "memo",
-                "group_payment",
-                "early_payment_discount_mode",
-                "contact_bank_account_id",
-                "company_currency_id",
-                "journal_payment_method_id",
-                "payment_difference",
-                "payment_difference_handling",
-                "difference_is_exchange_account",
-                "hide_difference_section",
-            ]
-        elif isinstance(instance, AccountPartialReconcile):
-            cf_mro = [
-                "company_id",
-                "company_currency_id",
-                "debit_move_line_currency_id",
-                "credit_move_line_currency_id",
-                "max_date",
-            ]
         elif isinstance(instance, ReconcileWizard) and update_fields:
             cf_mro = [x for x in cf_mro if x not in update_fields]
+
         if update_fields:
             update_fields = set(update_fields)
-            update_fields.update(set(cf_mro))
+            update_fields.update(cf_mro)
+
+        # Build a lookup: field_name → (group_name, group_fields, method_name)
+        raw_groups: Dict[str, Tuple[Set[str], str]] = getattr(model, "BATCH_COMPUTE_GROUPS", {})
+        field_to_group: Dict[str, Tuple[str, Set[str], str]] = {}
+        for group_name, (group_fields, method_name) in raw_groups.items():
+            for fld in group_fields:
+                field_to_group[fld] = (group_name, group_fields, method_name)
+
+        assigned_fields: Set[str] = set()
+        computed_groups: Set[str] = set()
+
+        # Iterate cf_mro in order; compute any group or single‐field as soon as its turn arrives
         for fieldname in cf_mro:
+            if fieldname in assigned_fields:
+                continue
+
+            if fieldname in field_to_group:
+                group_name, group_fields, method_name = field_to_group[fieldname]
+
+                # If this group hasn’t been computed yet, do it now
+                if group_name not in computed_groups:
+                    compute_fn = getattr(instance, method_name)
+                    result_dict = compute_fn()
+
+                    # Determine which fields in this group need assigning (ordered by cf_mro)
+                    intersecting = [f for f in cf_mro if f in group_fields]
+                    missing = [f for f in intersecting if f not in result_dict]
+                    if missing:
+                        raise KeyError(
+                            f"{method_name}() did not return values for these fields: {missing}"
+                        )
+
+                    # Assign all group‐computed values
+                    for f in intersecting:
+                        setattr(instance, f, result_dict[f])
+                        assigned_fields.add(f)
+
+                    computed_groups.add(group_name)
+
+                # If the group was already computed, this field is already in assigned_fields
+                continue
+
+            # Fallback: no batch group covers this field → compute individually
             setattr(instance, fieldname, self._compute(instance, model, fieldname))
+            assigned_fields.add(fieldname)
+
         if update_fields:
             return update_fields
         return None

@@ -461,6 +461,13 @@ class ComputedModelsGraph(Graph):
         self.modelgraphs: Dict[Type[Model], ModelGraph] = {}
         self.union: Optional[Graph] = None
 
+        self.custom_mro_map: Dict[Type[Model], List[str]] = {}
+        for model in computed_models.keys():
+            mro_list = getattr(model, 'computed_fields_mro', None)
+            if isinstance(mro_list, list) and all(isinstance(f, str) for f in mro_list):
+                self.custom_mro_map[model] = mro_list
+
+
     def _right_constrain(self, model: Type[Model], fieldname: str) -> None:
         """
         Sanity check for right side field types.
@@ -704,38 +711,45 @@ class ComputedModelsGraph(Graph):
 
     def generate_local_mro_map(self) -> ILocalMroMap:
         """
-        Generate model local computed fields mro maps.
-        Returns a mapping of models with local computed fields dependencies and their
-        `mro`, example:
+        Generate the local computed-field MRO maps, applying any model-level custom MROs.
 
-        .. code:: python
+        Models may define a class attribute:
 
-            {
-                modelX: {
-                    'base': ['c1', 'c2', 'c3'],
-                    'fields': {
-                        'name': ['c2', 'c3'],
-                        'c2': ['c2', 'c3']
-                    }
-                }
-            }
+            computed_fields_mro = ['cf1', 'cf2', ...]
 
-        In the example `modelX` would have 3 computed fields, where `c2` somehow depends on
-        the field `name`. `c3` itself depends on changes to `c2`, thus a change to `name` should
-        run `c2` and `c3` in that specific order.
-
-        `base` lists all computed fields in topological execution order (mro).
-        It is also used at runtime to cover a full update of an instance (``update_fields=None``).
-
-        .. NOTE::
-            Note that the actual values in `fields` are bitarrays to index positions of `base`,
-            which allows quick field update merges at runtime by doing binary OR on the bitarrays.
+        which will override the automatically calculated full-update order.
         """
         self.prepare_modelgraphs()
-        return dict(
-            (model, g.generate_local_mapping(g.generate_field_paths(g.get_topological_paths())))
-            for model, g in self.modelgraphs.items()
-        )
+        result: ILocalMroMap = {}
+
+        for model, modelgraph in self.modelgraphs.items():
+            # 1) build default node‑to‑field paths
+            tpaths = modelgraph.generate_field_paths(
+                modelgraph.get_topological_paths()
+            )
+
+            # 2) check for a custom base order, either from class or preloaded map
+            custom_base = self.custom_mro_map.get(model)
+            if custom_base:
+                # ensure custom list covers exactly the computed field names
+                default_base = tpaths.get('##', [])
+                if set(custom_base) != set(default_base):
+                    raise ComputedFieldsException(
+                        f"Custom MRO for {model} must contain the same computed fields: {default_base}"
+                    )
+                # inject custom base into paths
+                tpaths['##'] = custom_base
+                # regenerate the bitmask mapping against custom base
+                mro_data = modelgraph.generate_local_mapping(tpaths)
+                mro_data['base'] = custom_base
+            else:
+                # no override: use default MRO
+                mro_data = modelgraph.generate_local_mapping(tpaths)
+
+            result[model] = mro_data
+
+        return result
+
 
     def get_uniongraph(self) -> Graph:
         """
@@ -844,6 +858,7 @@ class ModelGraph(Graph):
         """
         # create simplified parent-child relation graph
         graph: Dict[Node, List[Node]] = {}
+        # raise Exception(f"{self.model} {self.edges}")
         for edge in self.edges:
             graph.setdefault(edge.left, []).append(edge.right)
         topological_paths: Dict[Node, List[Node]] = {}
